@@ -1,0 +1,13 @@
+# Exclude JS build tooling
+frontend/node_modules/
+
+# Exclude local state — ephemeral on Databricks Apps anyway
+state/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Un-ignore the built frontend — dist/ is in .gitignore but we need it deployed
+!frontend/dist/

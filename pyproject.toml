@@ -7,8 +7,12 @@ requires-python = ">=3.10"
 dependencies = [
     "databricks-sql-connector>=3.7.0",
     "databricks-sdk>=0.40.0",
-    "streamlit>=1.40.0",
+    "fastapi>=0.115.0",
+    "openpyxl>=3.1.0",
+    "pandas>=2.2.0",
     "pyarrow>=16.0.0",
+    "python-multipart>=0.0.12",
+    "uvicorn>=0.30.0",
 ]
 
 [tool.uv]

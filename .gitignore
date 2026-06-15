@@ -15,6 +15,7 @@ downloads/
 eggs/
 .eggs/
 lib/
+!app/lib/
 lib64/
 parts/
 sdist/
@@ -215,5 +216,6 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Streamlit
-.streamlit/secrets.toml
+# App local/generated state
+app/state/last_run.json
+app/frontend/node_modules/

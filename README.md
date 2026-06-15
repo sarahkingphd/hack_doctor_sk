@@ -90,3 +90,146 @@ Inspect the local raw files without querying Databricks:
 ```bash
 uv run python scripts/inspect_local_data.py
 ```
+
+## Databricks App Skeleton
+
+The clickable app skeleton lives under `app/` and uses FastAPI plus a Vite/React frontend.
+
+Build the frontend bundle:
+
+```bash
+cd app/frontend
+npm install
+npm run build
+```
+
+Run the app locally from the `app/` directory:
+
+```bash
+cd app
+../.venv/bin/uvicorn server:app --host 127.0.0.1 --port 8000
+```
+
+Open:
+
+```text
+http://127.0.0.1:8000
+```
+
+The Databricks App command is defined in `app/app.yaml`.
+
+### Data Backend
+
+The app separates the source dataset from the mutable app/result state:
+
+- `APP_SOURCE_MODE=checked_in`: read the checked-in/downloaded facilities CSV, falling back to a tiny demo dataset.
+- `APP_SOURCE_MODE=unity_catalog`: read source facilities from the Databricks Unity Catalog table.
+- `APP_STATE_MODE=local`: write scratchpad, parse output, decisions, and notes to local `app/state` files.
+- `APP_STATE_MODE=unity_catalog`: write scratchpad versions, result states, recommendations, risks, decisions, and audit events to Unity Catalog.
+
+`APP_DATA_MODE` still works as a preset:
+
+- `APP_DATA_MODE=local`: `APP_SOURCE_MODE=checked_in` + `APP_STATE_MODE=local`.
+- `APP_DATA_MODE=unity_catalog`: `APP_SOURCE_MODE=unity_catalog` + `APP_STATE_MODE=unity_catalog`. This is the default.
+
+Default DBX mode:
+
+```text
+APP_DATA_MODE=unity_catalog
+APP_SOURCE_MODE=unity_catalog
+APP_STATE_MODE=unity_catalog
+```
+
+Local app over the real Databricks catalog, with local scratchpad/results:
+
+```text
+APP_DATA_MODE=local
+APP_SOURCE_MODE=unity_catalog
+APP_STATE_MODE=local
+```
+
+Checked-in/offline click-through mode:
+
+```text
+APP_DATA_MODE=local
+APP_SOURCE_MODE=checked_in
+APP_STATE_MODE=local
+```
+
+Databricks source/target defaults:
+
+```text
+APP_SOURCE_CATALOG=databricks_virtue_foundation_dataset_dais_2026
+APP_SOURCE_SCHEMA=virtue_foundation_dataset
+APP_SOURCE_TABLE=facilities
+APP_RESULT_CATALOG=dais_readiness_desk
+```
+
+Before deploying with `APP_STATE_MODE=unity_catalog`, create the app-owned UC tables using:
+
+```text
+app/sql/unity_catalog_state.sql
+```
+
+In DBX mode, `/api/state` keeps an in-memory hot state. If Unity Catalog or the SQL warehouse is slow, the app serves cached or warm demo state immediately and refreshes in the background. Use `/api/status` for the cheap cache/backend status and `/api/diagnostics` only when you want explicit catalog/table checks.
+
+### Sharing the Deployed Databricks App
+
+If a workspace user sees the Databricks `Permission Required` page before the app loads, they need app-level access in Databricks. This happens before FastAPI, React, or app Basic Auth runs.
+
+UI fix:
+
+1. Open the Databricks app overview page.
+2. Click `Share`.
+3. For a demo workspace, choose `Anyone in my organization can use`.
+4. Save.
+
+Per-user or per-group fix:
+
+1. Open the Databricks app overview page.
+2. Click `Share`.
+3. Add the user or group.
+4. Grant `CAN USE`.
+5. Save.
+
+CLI fix:
+
+```bash
+databricks apps update-permissions dbx-hack-doctors \
+  --profile dbx_hack_doctors \
+  --json '{"access_control_list":[{"user_name":"person@example.com","permission_level":"CAN_USE"}]}'
+```
+
+For a group:
+
+```bash
+databricks apps update-permissions dbx-hack-doctors \
+  --profile dbx_hack_doctors \
+  --json '{"access_control_list":[{"group_name":"my-group","permission_level":"CAN_USE"}]}'
+```
+
+Use `update-permissions` for additive changes. Avoid `set-permissions` unless intentionally replacing the app's direct permission list.
+
+### App-level Basic Auth
+
+Databricks App sharing is the primary access-control path for deployed demos. The FastAPI app also includes an optional Basic Auth gate if you want an extra app-level password after Databricks workspace authentication. It is disabled by default.
+
+Local example:
+
+```bash
+cd app
+APP_BASIC_AUTH_ENABLED=true \
+APP_BASIC_AUTH_USERNAME=demo \
+APP_BASIC_AUTH_PASSWORD='change-me' \
+../.venv/bin/uvicorn server:app --host 127.0.0.1 --port 8000
+```
+
+For Databricks Apps deployment, set:
+
+```text
+APP_BASIC_AUTH_ENABLED=true
+APP_BASIC_AUTH_USERNAME=<demo username>
+APP_BASIC_AUTH_PASSWORD=<secret password>
+```
+
+Do not hardcode the password in `app.yaml`. Use Databricks app environment variables backed by a secret for `APP_BASIC_AUTH_PASSWORD`.

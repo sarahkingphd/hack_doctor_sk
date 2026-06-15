@@ -1,0 +1,9 @@
+fastapi>=0.115.0
+uvicorn>=0.30.0
+pandas
+openpyxl
+pyarrow
+python-multipart>=0.0.12
+databricks-sdk>=0.40.0
+databricks-sql-connector>=3.7.0
+openai>=1.0.0

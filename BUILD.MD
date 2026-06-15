@@ -78,11 +78,12 @@ This keeps the hackathon story clean: first show what is wrong with the current 
 
 Databricks Apps assumptions:
 
-- Build the first version as a Streamlit Databricks App.
+- Build the app as a FastAPI backend serving a Vite/React frontend.
 - Use Databricks workspace auth instead of a separate login screen.
+- Add an optional app-level Basic Auth gate for demo-link sharing.
 - Read and write through Unity Catalog tables.
 - Keep long-running profiling, dedupe, and AI extraction jobs behind buttons with visible run status.
-- Use Databricks SQL or Spark-backed tables for persisted outputs, not only Streamlit session state.
+- Use Databricks SQL or Spark-backed tables for persisted outputs, not only local JSON state.
 - Make the UI usable in a browser tab embedded in the Databricks workspace.
 
 ### Global App Frame
@@ -157,9 +158,10 @@ Key interactions:
 
 Implementation notes:
 
-- Use `st.metric` for headline KPIs.
-- Use `st.progress` for score components.
-- Use `st.dataframe` for the current dataset preview.
+- Use React components for headline KPI cards.
+- Use CSS progress bars for score components.
+- Use a table component for the current dataset preview.
+- Read state from `GET /api/state`.
 - Persist KPI snapshots to `readiness_kpi_snapshot`.
 
 ### Tab 2: Import + Actions Mockup
@@ -220,11 +222,11 @@ Key interactions:
 
 Implementation notes:
 
-- Use `st.file_uploader` with CSV and Excel support.
-- Use `pandas.read_csv` and `pandas.read_excel` locally in the app for preview.
+- Use React file input/dropzone with `POST /api/import/preview`.
+- Use `pandas.read_csv` and `pandas.read_excel` in FastAPI for upload preview.
 - Push staged rows into Unity Catalog only after validation.
-- Use `st.tabs` for queue segments.
-- Use `st.data_editor` when inline status changes are needed.
+- Use React tabs and filters for queue segments.
+- Use explicit API calls for inline status changes.
 - Apply actions through explicit buttons, not automatic table edits.
 - Store reviewer notes and status changes.
 - Persist action state to `action_recommendations`.
@@ -291,7 +293,7 @@ Palette:
 
 Typography:
 
-- Use Streamlit defaults unless custom CSS is needed.
+- Use app-local CSS with compact dashboard typography.
 - Keep headings compact.
 - Use short labels in tables and cards.
 
@@ -300,7 +302,7 @@ Component rules:
 - Buttons for clear commands: `Run Profile`, `Stage Records`, `Approve Merge`, `Apply AI Safe Fixes`.
 - Select boxes for filters and column mapping.
 - Tabs for queue states.
-- Expanders for evidence and source rows.
+- Detail panels for evidence and source rows.
 - Progress bars for score components.
 - Dataframes/editors for work queues.
 
@@ -562,67 +564,374 @@ This lets the app communicate uncertainty honestly and lets planners inspect why
 
 ## Data Architecture
 
+### Source State vs Resulting State
+
+The app has two different data states and they must not be mixed:
+
+1. **Source state**
+   - The original Marketplace data and any uploaded files.
+   - Treated as immutable input.
+   - Can be snapshotted and re-parsed, but not edited in place.
+   - Stored as Bronze/raw tables plus source snapshot metadata.
+
+2. **Resulting state**
+   - The app-owned planning/review state produced from a source snapshot plus scratchpad instructions.
+   - Users can mutate it by approving actions, rejecting recommendations, adding comments, changing tags, and saving planning notes.
+   - All recommendations and risks are computed only from the resulting state, not directly from raw source rows.
+   - Stored as Silver/Gold tables with run IDs, state version IDs, and append-only decision events.
+
+Workflow:
+
+```text
+source snapshot + scratchpad version
+  -> re-parse run
+  -> resulting state version
+  -> recommendations/actions/risks
+  -> human/AI decisions
+  -> next resulting state version
+```
+
+Basic version-control rules:
+
+- Never update source rows in place.
+- Every re-parse creates a new `run_id`.
+- Every materialized result creates a new `state_version_id`.
+- User/AI mutations are append-only events.
+- The app reads the latest active result state by default.
+- Users can compare result state versions before/after a re-parse.
+- Promotion to "planning-ready" is a metadata change, not a rewrite.
+
+### Unity Catalog Layout
+
+Recommended default:
+
+- Create one new app-owned catalog if permissions allow: `dais_readiness_desk`.
+- If catalog creation is not allowed, create a schema under an existing workspace/project catalog: `<existing_catalog>.dais_readiness_desk`.
+- Do not write into the Marketplace source catalog.
+
+Recommended schemas:
+
+- `source`: immutable source snapshots and uploaded raw files.
+- `work`: parsed/normalized/intermediate outputs.
+- `result`: versioned app state, recommendations, risks, decisions, and notes.
+- `audit`: run logs and user/AI event history.
+
+Naming pattern:
+
+```text
+dais_readiness_desk.source.*
+dais_readiness_desk.work.*
+dais_readiness_desk.result.*
+dais_readiness_desk.audit.*
+```
+
+If using an existing catalog:
+
+```text
+<existing_catalog>.dais_readiness_source.*
+<existing_catalog>.dais_readiness_work.*
+<existing_catalog>.dais_readiness_result.*
+<existing_catalog>.dais_readiness_audit.*
+```
+
 ### Bronze Tables
 
 Raw and staged data.
 
-- `raw_facilities`
-- `raw_uploaded_files`
-- `raw_uploaded_rows`
+- `source.source_snapshots`
+- `source.raw_facilities_snapshot`
+- `source.raw_uploaded_files`
+- `source.raw_uploaded_rows`
 
 ### Silver Tables
 
 Cleaned and normalized data.
 
-- `facility_records_normalized`
-- `facility_duplicate_candidates`
-- `facility_entity_clusters`
-- `facility_capability_evidence`
-- `data_quality_findings`
+- `work.parse_runs`
+- `work.facility_records_normalized`
+- `work.facility_duplicate_candidates`
+- `work.facility_entity_clusters`
+- `work.facility_capability_evidence`
+- `work.data_quality_findings`
 
 ### Gold Tables
 
 Planner-ready outputs.
 
-- `facility_entities`
-- `readiness_kpi_snapshot`
-- `action_recommendations`
-- `geo_risk_recommendations`
+- `result.result_state_versions`
+- `result.facility_entities`
+- `result.readiness_kpi_snapshot`
+- `result.action_recommendations`
+- `result.geo_risk_recommendations`
+- `result.scratchpad_versions`
+- `result.reviewer_notes`
+- `result.action_decisions`
+
+### Audit Tables
+
+Append-only operational history.
+
+- `audit.app_events`
+- `audit.reparse_events`
+- `audit.import_events`
+- `audit.decision_events`
+
+## AI Pipeline Architecture
+
+The app supports a multi-agent AI re-parse pipeline triggered by `POST /api/pipeline/start`. It runs in two modes controlled by `PIPELINE_MODE`:
+
+### Local mode (default, `PIPELINE_MODE=local`)
+
+Runs inside the FastAPI process using `asyncio`:
+
+```
+dedup  →  geo + shortage (parallel)  →  risk
+```
+
+State is written to `app/state/pipeline_{id}.json` and symlinked via `pipeline_current.json`. The frontend polls `GET /api/pipeline/status/{id}` every 3 seconds during execution.
+
+### Databricks mode (`PIPELINE_MODE=databricks`)
+
+Triggers a multi-task Databricks Job:
+
+- Task 1: `dedup` (no dependency)
+- Task 2: `geo` (depends on dedup)
+- Task 3: `shortage` (depends on dedup, runs in parallel with geo)
+- Task 4: `risk` (depends on geo + shortage)
+
+Each task runs `jobs/run_agent.py <agent_name>` and shares state via the Databricks Workspace API. The FastAPI app polls the job run and mirrors task states into the pipeline state JSON.
+
+Setup: `python scripts/setup_dbx_job.py` — creates the job and writes `DATABRICKS_PIPELINE_JOB_ID` to `.env`.
+
+### DedupAgent — two modes
+
+The dedup agent supports **analysis mode** (standard dedup within the existing dataset) and **ingest mode** (comparing incoming records against the existing dataset).
+
+Ingest mode is triggered by passing `incoming_records` in the pipeline start payload:
+```
+POST /api/pipeline/start
+{"incoming_records": [...rows from upload preview...]}
+```
+
+In ingest mode, the agent returns per-record decisions:
+- `insert`: new facility not in existing data
+- `update`: matches an existing record; incoming data is fresher
+- `duplicate`: already present with equal or better data — skip
+- `review`: ambiguous match needing human inspection
+
+### Agent outputs
+
+- **DedupAgent**: cluster merge/split/review decisions (analysis mode) or insert/update/duplicate/review per incoming record (ingest mode)
+- **GeoAgent**: flagged records, coverage gaps, geographic summary
+- **ShortageAgent**: shortage areas by state/care type, severity levels
+- **RiskAgent**: risk matrix, executive summary, `data_readiness_score`, `planning_readiness_score`
+
+### LLM backend
+
+Agents use Databricks Foundation Models via OpenAI-compatible endpoint:
+
+```python
+OpenAI(
+    api_key=<DATABRICKS_TOKEN>,
+    base_url=f"https://{DATABRICKS_HOST}/serving-endpoints",
+)
+```
+
+Default model: `databricks-meta-llama-3-3-70b-instruct` (override with `DATABRICKS_LLM_MODEL`).
+
+### Pipeline state shape
+
+```json
+{
+  "pipeline_id": "a3f8bc1d2e",
+  "status": "running|completed|failed",
+  "mode": "analysis|ingest",
+  "started_at": "...",
+  "completed_at": "...",
+  "context": {"incoming_records": [...]},
+  "agents": {
+    "dedup":    {"status": "completed", "result": {...}, "started_at": "...", "completed_at": "..."},
+    "geo":      {"status": "running",   "started_at": "..."},
+    "shortage": {"status": "pending"},
+    "risk":     {"status": "pending"}
+  }
+}
+```
+
+### Pipeline API routes
+
+- `POST /api/pipeline/start` — start a pipeline run; optional body `{"mode": "local|databricks", "incoming_records": [...]}`
+- `GET /api/pipeline/status` — current (most recent) pipeline state
+- `GET /api/pipeline/status/{pipeline_id}` — specific run state
 
 ## Suggested Databricks Stack
 
-- Databricks App frontend with Streamlit for the fastest dashboard build.
+- Databricks App served by FastAPI.
+- Vite/React frontend for the rich three-tab workflow.
+- FastAPI API routes for scratchpad saves, upload previews, re-parse triggers, action decisions, pipeline control, and risk outputs.
 - Unity Catalog tables for Bronze/Silver/Gold data.
 - Databricks SQL for aggregations and KPI queries.
-- Spark for dedupe, profiling, and fuzzy matching jobs.
-- Mosaic AI / model serving for evidence extraction and recommendation explanations if available.
+- Databricks Foundation Models (OpenAI-compatible `/serving-endpoints`) for AI agents.
+- Databricks multi-task Jobs for pipeline execution in Databricks mode.
 - MLflow or table-based audit logs for recommendation runs.
+
+## Current Implementation
+
+The current app is a clickable Databricks App skeleton with a local/offline mode and a DBX/Unity Catalog default mode:
+
+- FastAPI backend in `app/server.py`.
+- React/Vite frontend in `app/frontend/`.
+- Databricks App command in `app/app.yaml`.
+- Hot in-memory `/api/state` cache with background refresh and warm demo fallback.
+- Local scratchpad state in `app/state/scratchpad.md`.
+- Local/generated re-parse state in `app/state/last_run.json`.
+- Source/state loader in `app/lib/store.py` for checked-in CSV, Unity Catalog, and demo fallback modes.
+- Mock profiling, recommendation, and risk generator in `app/lib/reparser.py`.
+- Multi-agent pipeline in `app/lib/pipeline.py` and `app/lib/agents/`.
+- Databricks Job task entrypoint in `app/jobs/run_agent.py`.
+- Databricks Foundation Models client in `app/lib/llm.py`.
+- Deployment helper in `run.sh` and Databricks Job setup script in `scripts/setup_dbx_job.py`.
+
+Current workflow:
+
+1. In checked-in source mode, app loads the downloaded facilities table from `data/raw/.../facilities/facilities.csv.gz`.
+2. In Databricks source mode, app reads facilities from `APP_SOURCE_CATALOG.APP_SOURCE_SCHEMA.APP_SOURCE_TABLE`.
+3. User edits the Markdown scratchpad.
+4. User saves or triggers re-parse.
+5. FastAPI regenerates profile metrics, actions, tags, and risk recommendations.
+6. In local state mode, resulting state is written to `app/state`.
+7. In Databricks state mode, resulting state is written to `APP_RESULT_CATALOG.result.*` and `APP_RESULT_CATALOG.audit.*`.
+8. React UI refreshes the three tabs from `GET /api/state`.
+
+Current data backend modes:
+
+- `APP_SOURCE_MODE=checked_in`: source is the checked-in/downloaded CSV, with a tiny demo fallback.
+- `APP_SOURCE_MODE=unity_catalog`: source is the Databricks Unity Catalog facilities table.
+- `APP_STATE_MODE=local`: scratchpad, parse output, decisions, and notes live in `app/state`.
+- `APP_STATE_MODE=unity_catalog`: scratchpad, result state, recommendations, risks, decisions, and audit events live in Unity Catalog.
+- `APP_DATA_MODE=local`: compatibility preset for checked-in source plus local state.
+- `APP_DATA_MODE=unity_catalog`: compatibility preset for Unity Catalog source plus Unity Catalog state. This is the default.
+
+Default DBX mode:
+
+```text
+APP_DATA_MODE=unity_catalog
+APP_SOURCE_MODE=unity_catalog
+APP_STATE_MODE=unity_catalog
+```
+
+Useful local hybrid:
+
+```text
+APP_DATA_MODE=local
+APP_SOURCE_MODE=unity_catalog
+APP_STATE_MODE=local
+```
+
+Checked-in/offline click-through mode:
+
+```text
+APP_DATA_MODE=local
+APP_SOURCE_MODE=checked_in
+APP_STATE_MODE=local
+```
+
+Databricks deployment target:
+
+```text
+APP_DATA_MODE=unity_catalog
+APP_SOURCE_MODE=unity_catalog
+APP_STATE_MODE=unity_catalog
+APP_SOURCE_CATALOG=databricks_virtue_foundation_dataset_dais_2026
+APP_SOURCE_SCHEMA=virtue_foundation_dataset
+APP_SOURCE_TABLE=facilities
+APP_RESULT_CATALOG=dais_readiness_desk
+```
+
+Runtime behavior:
+
+- `/api/state` is cache-first from a user-experience perspective.
+- If DBX/UC state loading is slow or unavailable, the app serves in-memory cached state or a warm demo state and refreshes in the background.
+- The main UI should not show full-width backend failure messages during normal use.
+- `/api/status` exposes cheap cache status.
+- `/api/diagnostics` is reserved for explicit catalog/table debugging.
+- Databricks App sharing should be set to `Anyone in my organization can use` for the demo workspace unless stricter sharing is required.
+
+Current API routes:
+
+- `GET /api/health`
+- `GET /api/config`
+- `GET /api/status`
+- `GET /api/diagnostics`
+- `GET /api/state`
+- `POST /api/scratchpad`
+- `POST /api/reparse`
+- `POST /api/import/preview`
+- `POST /api/actions/{action_id}/decision`
+- `POST /api/pipeline/start` — body: `{"mode": "local|databricks", "incoming_records": [...]?}`
+- `GET /api/pipeline/status` — most recent pipeline state
+- `GET /api/pipeline/status/{pipeline_id}` — specific run state
+
+Current app-level auth:
+
+- Databricks Apps already enforce workspace/app permissions before the FastAPI app runs.
+- For demo workspace access, use Databricks App `Share` -> `Anyone in my organization can use`.
+- Basic Auth middleware lives in `app/server.py`.
+- It is optional and disabled by default with `APP_BASIC_AUTH_ENABLED=false`.
+- It can be enabled with `APP_BASIC_AUTH_ENABLED=true`.
+- Credentials are read from `APP_BASIC_AUTH_USERNAME` and `APP_BASIC_AUTH_PASSWORD`.
+- `/api/health` stays unauthenticated for deployment smoke checks.
+- In Databricks Apps, store the password as a Databricks secret and pass it through `app.yaml` using `valueFrom`.
+
+Local run commands:
+
+```bash
+cd app/frontend
+npm install
+npm run build
+cd ..
+../.venv/bin/uvicorn server:app --host 127.0.0.1 --port 8000
+```
 
 ## App Skeleton
 
 ```text
 app/
-  app.py
   app.yaml
-  requirements.txt
-  tabs/
-    current_dataset.py
-    import_actions.py
-    risk_recommendations.py
+  requirements.txt        # includes openai>=1.0.0
+  server.py
+  frontend/
+    index.html
+    package.json
+    vite.config.js
+    src/
+      main.jsx
+      styles.css
+    dist/                 # built by: npm run build (committed for deploy)
   lib/
-    databricks.py
-    kpi.py
-    profiling.py
-    dedupe.py
-    evidence.py
-    recommendations.py
-    uploads.py
-  sql/
-    bronze.sql
-    silver.sql
-    gold.sql
-  sample_data/
-    facilities_sample.csv
+    databricks.py         # UC SQL connector, auth helpers, config summary
+    store.py              # source/state loader (local + UC modes)
+    reparser.py           # mock profiler, action/risk generator
+    llm.py                # Databricks Foundation Models via OpenAI SDK
+    pipeline_state.py     # pipeline state shape + local/workspace backends
+    pipeline.py           # orchestrator: local asyncio or Databricks Job
+    agents/
+      __init__.py
+      base.py             # BaseAgent with LLM helper + state transitions
+      dedup.py            # DedupAgent — analysis mode + ingest mode
+      geo.py              # GeoAgent — geographic quality + coverage gaps
+      shortage.py         # ShortageAgent — care shortage by state
+      risk.py             # RiskAgent — risk matrix + planning readiness scores
+  jobs/
+    run_agent.py          # Databricks Job task entrypoint
+  state/
+    scratchpad.md
+    last_run.json         # gitignored
+    pipeline_*.json       # gitignored
+scripts/
+  setup_dbx_job.py        # create/update the multi-task Databricks Job
+run.sh                    # ui | api | dev | deploy [name] | open [name]
+setup.sh                  # teammate onboarding: env, venv, DBX profile
 ```
 
 ## First Build Milestone
@@ -631,12 +940,13 @@ Goal: A clickable dashboard that tells the story end to end with real or sample 
 
 Deliverables:
 
-- Streamlit Databricks App skeleton.
+- FastAPI + React/Vite Databricks App skeleton.
 - `Current Dataset` tab with KPI cards, current stats, and dataset preview.
 - `Import + Actions` tab with upload control for XLS/XLSX/CSV.
 - Mocked or live recommendation/action table.
 - `Risk Recommendations` tab with planning-risk table.
 - Basic evidence drawer for one selected recommendation.
+- Markdown scratchpad with save and re-parse trigger.
 
 Acceptance criteria:
 
@@ -645,6 +955,7 @@ Acceptance criteria:
 - Recommendations and duplicate issues are ranked by priority.
 - Recommendations clearly say whether AI can fix them or a human should review.
 - Risk recommendations separate real care gaps from data-poor regions.
+- Re-parse updates metrics, actions, tags, and risk rows.
 
 ## Second Build Milestone
 
@@ -731,10 +1042,15 @@ Why it is practical:
 
 ## Immediate Next Steps
 
-1. Explore the Databricks catalog and identify the facility dataset table.
-2. Download or query a representative sample.
-3. Create the Streamlit app skeleton under `app/`.
-4. Implement the KPI calculation on sample data.
-5. Implement the first duplicate candidate generator.
-6. Build the action queue UI.
-7. Add the risk recommendations view using trust-weighted geography aggregates.
+1. Set Databricks App sharing to `Anyone in my organization can use` for the demo workspace.
+2. Review and execute `app/sql/unity_catalog_state.sql`, or choose an existing writable catalog fallback.
+3. Verify app/service-principal permissions for source table read, SQL warehouse use, and result/work/audit writes.
+4. Smoke-test deployed `/api/status`, `/api/config`, `/api/state`, and `/api/diagnostics`.
+5. Persist pipeline results into Unity Catalog (`work.*`, `result.action_recommendations`, `result.geo_risk_recommendations`).
+6. Replace mock risk rows in `RiskRecommendations` tab with RiskAgent output when pipeline has completed.
+7. Wire DedupAgent ingest results into the Risk Recommendations tab (post-ingest risk synthesis).
+8. Add `POST /api/import/stage` and stage uploaded rows into source/work tables.
+9. Add real duplicate candidate scoring in `lib/reparser.py` using actual field similarity.
+10. Add export/save workflows for review CSVs, pipeline results, and planning-risk snapshots.
+11. Add pagination or virtual scrolling for large dataset preview and action rows.
+12. Add column mapping UI for imported files (map upload columns to canonical facility schema).
